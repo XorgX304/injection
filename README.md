@@ -7,5 +7,7 @@
 <li><a href="https://modexp.wordpress.com/2018/08/26/process-injection-ctray/">ExtraBytes</a></li>
 <li><a href="https://modexp.wordpress.com/2018/08/23/process-injection-propagate/">PROPagate</a></li>
 <li><a href="https://modexp.wordpress.com/2018/08/30/windows-process-injection-control-handler/">SvcCtrl</a></li>
+<li><a href="https://modexp.wordpress.com/2019/03/07/process-injection-print-spooler/">Print Spooler</a></li>
+<li><a href="">ALPC</a></li>
 </ul>
 

