@@ -251,7 +251,7 @@ BOOL ALPC_Connect(std::wstring path) {
 
     RtlInitUnicodeString(&server, path.c_str());
     
-		status = NtConnectPort(&h, &server, &ss, NULL, 
+    status = NtConnectPort(&h, &server, &ss, NULL, 
       NULL, (PULONG)&MsgLen, NULL, NULL);
       
     NtClose(h);
